@@ -1,15 +1,3 @@
-"""
-LexGuard Legal Analyzer Backend
-================================
-pip install flask flask-cors opengradient python-dotenv gunicorn
-
-.env:
-  OG_PRIVATE_KEY=0x...
-
-Run:
-  python legal-backend.py
-"""
-
 import os, json, re, time, threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
