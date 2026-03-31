@@ -12,14 +12,17 @@ llm_client = None
 og = None
 WORKING_MODEL = None
 
-# Все возможные модели
 MODEL_PRIORITY = [
-    "GPT_5_MINI",
-    "CLAUDE_HAIKU_4_5",
-    "GEMINI_2_5_FLASH",
     "GEMINI_2_5_FLASH_LITE",
+    "GEMINI_2_5_FLASH",
+    "CLAUDE_HAIKU_4_5",
+    "GPT_5_MINI",
     "CLAUDE_SONNET_4_5",
+    "CLAUDE_SONNET_4_6",
+    "GEMINI_2_5_PRO",
+    "CLAUDE_OPUS_4_5",
     "GPT_5",
+    "O4_MINI",
 ]
 
 _loop = None
@@ -33,11 +36,12 @@ def _start_loop():
 
 def _run(coro):
     future = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return future.result(timeout=90)
+    return future.result(timeout=120)
 
 try:
     import opengradient as _og
     import ssl, urllib3
+
     og = _og
     ssl._create_default_https_context = ssl._create_unverified_context
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -46,20 +50,26 @@ try:
     _loop_thread.start()
     time.sleep(0.2)
 
-    private_key = os.environ.get("OG_PRIVATE_KEY", "")
-    if private_key:
-        llm_client = og.LLM(private_key=private_key)
-        OG_OK = True
-        print("✅ OpenGradient connected")
+    private_key = os.environ["OG_PRIVATE_KEY"]
+    llm_client = og.LLM(private_key=private_key)
+
+    try:
+        approval = llm_client.ensure_opg_approval(opg_amount=10)
+        print(f"OPG approval: {approval}")
+    except Exception as e:
+        print(f"Approval warning: {e}")
+
+    OG_OK = True
+    print("OG connected")
 except Exception as e:
-    print(f"❌ OpenGradient init error: {e}")
+    print(f"Demo mode: {e}")
+
 
 def probe_models():
     global WORKING_MODEL
-    if not OG_OK or llm_client is None or og is None:
-        return False
-    
-    print("🔍 Probing models...")
+    if not OG_OK or llm_client is None:
+        return
+    print("Probing models...")
     for name in MODEL_PRIORITY:
         if not hasattr(og.TEE_LLM, name):
             continue
@@ -71,32 +81,50 @@ def probe_models():
                 messages=[{"role": "user", "content": "Reply: OK"}],
                 max_tokens=5,
                 temperature=0.0,
-                x402_settlement_mode=og.x402SettlementMode.PRIVATE
             ))
             raw = extract_raw(result)
             if raw and raw.strip():
                 WORKING_MODEL = model
-                print(f"✅ Using model: {name}")
-                return True
+                print(f"Using model: {name}")
+                return
         except Exception as e:
-            print(f"  ❌ {name}: {e}")
-    print("❌ No working model found")
-    return False
+            print(f"  FAIL {name}: {e}")
+    print("No working model found.")
 
-SYSTEM_PROMPT = """You are an expert legal analyst. Analyze the document and reply ONLY with valid JSON.
 
-Return structure:
+SYSTEM_PROMPT = """You are an expert legal analyst. Analyze the provided legal document and reply ONLY with valid JSON inside <JSON>...</JSON> tags. No text outside.
+
+Return this exact structure:
+<JSON>
 {
   "document_type": "Employment Agreement",
   "risk_score": 62,
   "clause_count": 24,
-  "summary": "Brief summary",
+  "summary": "2-3 sentence summary of the document and overall risk assessment.",
   "risks": [
-    {"level": "high", "title": "...", "explanation": "...", "recommendation": "..."}
+    {
+      "level": "high",
+      "title": "Overly broad non-compete clause",
+      "clause": "Section 8.2",
+      "explanation": "Clear explanation of why this clause is risky.",
+      "quote": "Exact or paraphrased text from the clause",
+      "recommendation": "Specific actionable advice."
+    }
   ],
-  "recommendations": ["Rec 1", "Rec 2"]
+  "recommendations": [
+    "Consult a licensed attorney before signing",
+    "Request removal of the non-compete clause"
+  ]
 }
+</JSON>
+
+Rules:
+- risk_score: 0-100 (higher = more risky for the signing party)
+- risks: 3-8 issues ordered high to medium to low
+- level: must be exactly "high", "medium", or "low"
+- Be specific, not generic
 """
+
 
 def extract_raw(result):
     if not result:
@@ -104,96 +132,154 @@ def extract_raw(result):
     co = getattr(result, 'chat_output', None)
     if co:
         if isinstance(co, dict):
-            for k in ('content', 'text', 'message', 'response'):
+            for k in ('content', 'text', 'message', 'response', 'output'):
                 if co.get(k):
                     return str(co[k])
-        elif isinstance(co, str):
+        elif isinstance(co, str) and co.strip():
             return co
+    comp = getattr(result, 'completion_output', None)
+    if comp and str(comp).strip():
+        return str(comp)
+    if hasattr(result, 'text'):
+        return result.text
+    for attr in dir(result):
+        if attr.startswith('_'):
+            continue
+        try:
+            val = getattr(result, attr)
+            if callable(val):
+                continue
+            if isinstance(val, str) and ('<JSON>' in val or '"risk_score"' in val):
+                return val
+        except:
+            pass
     return ""
 
+
 def parse_json(raw):
-    if not raw:
-        return {"error": "Empty"}
+    if not raw or not raw.strip():
+        return {"error": "Empty response"}
     m = re.search(r"<JSON>(.*?)</JSON>", raw, re.DOTALL)
     if m:
         try:
-            return json.loads(m.group(1))
-        except:
-            pass
+            return json.loads(m.group(1).strip())
+        except Exception as e:
+            print(f"JSON parse error: {e}")
     m = re.search(r'\{[\s\S]*?"risk_score"[\s\S]*\}', raw)
     if m:
         try:
             return json.loads(m.group(0))
         except:
             pass
-    return {"error": "Parse failed"}
+    return {"error": "Parse failed", "raw": raw[:300]}
 
-def call_llm(messages):
+
+def call_llm(messages, retries=3):
     global WORKING_MODEL
     if not OG_OK or llm_client is None:
         return {"error": "OpenGradient not available"}
-    
+
     if WORKING_MODEL is None:
-        if not probe_models():
-            return {"error": "No working model found"}
-    
-    for attempt in range(3):
+        probe_models()
+    if WORKING_MODEL is None:
+        return {"error": "No working model found"}
+
+    last_error = ""
+    for attempt in range(retries):
         try:
-            print(f"🔄 Attempt {attempt+1}")
+            print(f"LLM attempt {attempt+1} | model: {WORKING_MODEL}")
             result = _run(llm_client.chat(
                 model=WORKING_MODEL,
                 messages=messages,
-                max_tokens=2000,
+                max_tokens=3000,
                 temperature=0.3,
-                x402_settlement_mode=og.x402SettlementMode.PRIVATE
             ))
             raw = extract_raw(result)
-            if raw:
-                parsed = parse_json(raw)
-                if "error" not in parsed:
-                    tx = getattr(result, "transaction_hash", None)
-                    if tx:
-                        parsed["proof"] = {"transaction_hash": tx}
-                    return parsed
+            if not raw.strip():
+                last_error = "Empty response"
+                time.sleep(2)
+                continue
+            parsed = parse_json(raw)
+            if "error" in parsed:
+                last_error = parsed["error"]
+                time.sleep(1)
+                continue
+            tx = getattr(result, "transaction_hash", None)
+            if tx:
+                parsed["proof"] = {
+                    "transaction_hash": tx,
+                    "explorer_url": f"https://explorer.opengradient.ai/tx/{tx}",
+                }
+            return parsed
         except Exception as e:
-            print(f"❌ Error: {e}")
+            last_error = str(e)
+            print(f"LLM error attempt {attempt+1}: {e}")
             if "402" in str(e):
-                print("Need OPG tokens!")
-            time.sleep(2)
-    
-    return {"error": "Failed after 3 attempts"}
+                WORKING_MODEL = None
+                probe_models()
+                if WORKING_MODEL is None:
+                    break
+            else:
+                time.sleep(2)
+
+    return {"error": f"All attempts failed: {last_error}"}
+
 
 @app.route("/health")
 def health():
     return jsonify({
         "status": "ok",
-        "og_connected": OG_OK,
-        "model_ready": WORKING_MODEL is not None,
-        "model": str(WORKING_MODEL) if WORKING_MODEL else None
+        "og": OG_OK,
+        "model": str(WORKING_MODEL) if WORKING_MODEL else None,
     })
+
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
     data = request.json or {}
-    doc_text = data.get("doc_text", "").strip()
-    doc_type = data.get("doc_type", "Legal Document")
-    
-    if not doc_text:
-        return jsonify({"error": "doc_text required"}), 400
-    
-    if len(doc_text) > 6000:
-        doc_text = doc_text[:6000] + "\n...[truncated]"
-    
+    doc_text = (data.get("doc_text") or "").strip()
+    pdf_base64 = data.get("pdf_base64")
+    doc_type = (data.get("doc_type") or "Legal Document").strip()
+
+    if not doc_text and not pdf_base64:
+        return jsonify({"error": "doc_text or pdf_base64 is required"}), 400
+
+    print(f"\nAnalyzing document | type: '{doc_type}'")
+
+    user_content = []
+
+    if pdf_base64:
+        try:
+            user_content.append({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": pdf_base64
+                }
+            })
+            print("PDF attached")
+        except Exception as e:
+            print(f"PDF error: {e}")
+            return jsonify({"error": "Failed to process PDF"}), 400
+
+    if doc_text:
+        user_content.append({"type": "text", "text": f"LEGAL DOCUMENT:\n\n{doc_text}"})
+
+    user_content.append({"type": "text", "text": f"Document type: {doc_type}\n\nAnalyze and return the JSON."})
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Document type: {doc_type}\n\n{doc_text}"}
+        {"role": "user", "content": user_content if len(user_content) > 1 else user_content[0]["text"]}
     ]
-    
+
     result = call_llm(messages)
-    if "error" in result:
-        return jsonify(result), 500
     return jsonify(result)
 
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 5002))
+    print(f"LexGuard on :{port} | OG: {'live' if OG_OK else 'demo'}")
+    if OG_OK:
+        probe_models()
+    app.run(host="0.0.0.0", port=port, debug=False)
