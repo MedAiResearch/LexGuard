@@ -65,65 +65,16 @@ except Exception as e:
     print(f"Demo mode: {e}")
 
 
-def probe_models():
-    global WORKING_MODEL
-    if not OG_OK or llm_client is None:
-        return
-    print("Probing models...")
-    for name in MODEL_PRIORITY:
-        if not hasattr(og.TEE_LLM, name):
-            continue
-        model = getattr(og.TEE_LLM, name)
+def self_ping():
+    import urllib.request
+    while True:
+        time.sleep(240)
         try:
-            print(f"Testing {name}...")
-            result = _run(llm_client.chat(
-                model=model,
-                messages=[{"role": "user", "content": "Reply: OK"}],
-                max_tokens=5,
-                temperature=0.0,
-            ))
-            raw = extract_raw(result)
-            if raw and raw.strip():
-                WORKING_MODEL = model
-                print(f"Using model: {name}")
-                return
+            url = os.environ.get("RENDER_EXTERNAL_URL", "https://lexguard-1h71.onrender.com")
+            urllib.request.urlopen(f"{url}/health", timeout=10)
+            print("Self-ping OK")
         except Exception as e:
-            print(f"  FAIL {name}: {e}")
-    print("No working model found.")
-
-
-SYSTEM_PROMPT = """You are an expert legal analyst. Analyze the provided legal document and reply ONLY with valid JSON inside <JSON>...</JSON> tags. No text outside.
-
-Return this exact structure:
-<JSON>
-{
-  "document_type": "Employment Agreement",
-  "risk_score": 62,
-  "clause_count": 24,
-  "summary": "2-3 sentence summary of the document and overall risk assessment.",
-  "risks": [
-    {
-      "level": "high",
-      "title": "Overly broad non-compete clause",
-      "clause": "Section 8.2",
-      "explanation": "Clear explanation of why this clause is risky.",
-      "quote": "Exact or paraphrased text from the clause",
-      "recommendation": "Specific actionable advice."
-    }
-  ],
-  "recommendations": [
-    "Consult a licensed attorney before signing",
-    "Request removal of the non-compete clause"
-  ]
-}
-</JSON>
-
-Rules:
-- risk_score: 0-100 (higher = more risky for the signing party)
-- risks: 3-8 issues ordered high to medium to low
-- level: must be exactly "high", "medium", or "low"
-- Be specific, not generic
-"""
+            print(f"Self-ping failed: {e}")
 
 
 def extract_raw(result):
@@ -154,6 +105,33 @@ def extract_raw(result):
         except:
             pass
     return ""
+
+
+def probe_models():
+    global WORKING_MODEL
+    if not OG_OK or llm_client is None:
+        return
+    print("Probing models...")
+    for name in MODEL_PRIORITY:
+        if not hasattr(og.TEE_LLM, name):
+            continue
+        model = getattr(og.TEE_LLM, name)
+        try:
+            print(f"Testing {name}...")
+            result = _run(llm_client.chat(
+                model=model,
+                messages=[{"role": "user", "content": "Reply: OK"}],
+                max_tokens=5,
+                temperature=0.0,
+            ))
+            raw = extract_raw(result)
+            if raw and raw.strip():
+                WORKING_MODEL = model
+                print(f"Using model: {name}")
+                return
+        except Exception as e:
+            print(f"  FAIL {name}: {e}")
+    print("No working model found.")
 
 
 def parse_json(raw):
@@ -225,6 +203,40 @@ def call_llm(messages, retries=3):
     return {"error": f"All attempts failed: {last_error}"}
 
 
+SYSTEM_PROMPT = """You are an expert legal analyst. Analyze the provided legal document and reply ONLY with valid JSON inside <JSON>...</JSON> tags. No text outside.
+
+Return this exact structure:
+<JSON>
+{
+  "document_type": "Employment Agreement",
+  "risk_score": 62,
+  "clause_count": 24,
+  "summary": "2-3 sentence summary of the document and overall risk assessment.",
+  "risks": [
+    {
+      "level": "high",
+      "title": "Overly broad non-compete clause",
+      "clause": "Section 8.2",
+      "explanation": "Clear explanation of why this clause is risky.",
+      "quote": "Exact or paraphrased text from the clause",
+      "recommendation": "Specific actionable advice."
+    }
+  ],
+  "recommendations": [
+    "Consult a licensed attorney before signing",
+    "Request removal of the non-compete clause"
+  ]
+}
+</JSON>
+
+Rules:
+- risk_score: 0-100 (higher = more risky for the signing party)
+- risks: 3-8 issues ordered high to medium to low
+- level: must be exactly "high", "medium", or "low"
+- Be specific, not generic
+"""
+
+
 @app.route("/")
 def index():
     return jsonify({"status": "ok", "service": "LexGuard"})
@@ -282,13 +294,16 @@ def analyze():
     return jsonify(result)
 
 
+def on_starting(server):
+    threading.Thread(target=self_ping, daemon=True).start()
+    if OG_OK:
+        threading.Thread(target=probe_models, daemon=True).start()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     print(f"LexGuard on :{port} | OG: {'live' if OG_OK else 'demo'}")
-    app.run(host="0.0.0.0", port=port, debug=False)
-
-
-# Запуск через gunicorn — пробинг моделей в фоне
-def on_starting(server):
+    threading.Thread(target=self_ping, daemon=True).start()
     if OG_OK:
         threading.Thread(target=probe_models, daemon=True).start()
+    app.run(host="0.0.0.0", port=port, debug=False)
