@@ -225,6 +225,11 @@ def call_llm(messages, retries=3):
     return {"error": f"All attempts failed: {last_error}"}
 
 
+@app.route("/")
+def index():
+    return jsonify({"status": "ok", "service": "LexGuard"})
+
+
 @app.route("/health")
 def health():
     return jsonify({
@@ -280,6 +285,10 @@ def analyze():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     print(f"LexGuard on :{port} | OG: {'live' if OG_OK else 'demo'}")
-    if OG_OK:
-        probe_models()
     app.run(host="0.0.0.0", port=port, debug=False)
+
+
+# Запуск через gunicorn — пробинг моделей в фоне
+def on_starting(server):
+    if OG_OK:
+        threading.Thread(target=probe_models, daemon=True).start()
