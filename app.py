@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 app = Flask(__name__)
+
+# Allow requests from any origin (both local dev and Render static site)
 CORS(app, origins="*")
 
 OG_OK = False
@@ -70,7 +72,8 @@ def self_ping():
     while True:
         time.sleep(240)
         try:
-            url = os.environ.get("RENDER_EXTERNAL_URL", "https://lexguard-1h71.onrender.com")
+            # Read the URL from env so it works on any Render deployment
+            url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5002")
             urllib.request.urlopen(f"{url}/health", timeout=10)
             print("Self-ping OK")
         except Exception as e:
@@ -295,6 +298,7 @@ def analyze():
 
 
 def on_starting(server):
+    """Called by gunicorn on startup."""
     threading.Thread(target=self_ping, daemon=True).start()
     if OG_OK:
         threading.Thread(target=probe_models, daemon=True).start()
