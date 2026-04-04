@@ -374,6 +374,7 @@ textarea::placeholder{color:var(--text3)}
 </div>
 
 <script>
+// ─── Canvas background ───────────────────────────────────────────────────────
 (()=>{
   const c=document.getElementById('c'),ctx=c.getContext('2d');
   let W,H,t=0;
@@ -419,6 +420,10 @@ textarea::placeholder{color:var(--text3)}
   window.addEventListener('resize',resize);
 })();
 
+// ─── API URL ─────────────────────────────────────────────────────────────────
+const API = 'https://lexguard-1h71.onrender.com';
+
+// ─── UI state ────────────────────────────────────────────────────────────────
 function goTo(i){document.getElementById('vp').className='vp s'+i}
 
 let inputMode='text',docType='Employment',pdfB64=null;
@@ -453,7 +458,7 @@ dz.addEventListener('drop',e=>{
   if(f&&f.type==='application/pdf'){document.getElementById('pdf-input').files=e.dataTransfer.files;onFile(document.getElementById('pdf-input'))}
 });
 
-const API='https://lexguard-1h71.onrender.com';
+// ─── Analysis ────────────────────────────────────────────────────────────────
 let analysisData=null;
 
 async function startAnalysis(){
