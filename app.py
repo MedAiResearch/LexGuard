@@ -11,8 +11,9 @@ OG_OK = False
 llm_client = None
 og = None
 WORKING_MODEL = None
+_loop = None
+_ready = False  # True once background init finishes
 
-# Models ordered cheapest/fastest first — Claude Haiku is cheapest on testnet
 MODEL_PRIORITY = [
     "CLAUDE_HAIKU_4_5",
     "CLAUDE_SONNET_4_5",
@@ -22,7 +23,7 @@ MODEL_PRIORITY = [
     "GEMINI_2_5_FLASH",
 ]
 
-_loop = None
+# ── Async event loop in its own thread ───────────────────────────────────────
 
 def _start_loop():
     global _loop
@@ -30,69 +31,60 @@ def _start_loop():
     asyncio.set_event_loop(_loop)
     _loop.run_forever()
 
-def _run(coro, timeout=120):
-    future = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return future.result(timeout=timeout)
-
-# Start event loop thread immediately
 threading.Thread(target=_start_loop, daemon=True).start()
-time.sleep(0.3)
+time.sleep(0.2)
 
-try:
-    import opengradient as _og
-    import ssl, urllib3
+def _run(coro, timeout=120):
+    return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=timeout)
 
-    og = _og
-    ssl._create_default_https_context = ssl._create_unverified_context
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# ── OG init — runs in background, never blocks gunicorn ──────────────────────
 
-    private_key = os.environ.get("OG_PRIVATE_KEY", "")
-    if not private_key:
-        raise ValueError("OG_PRIVATE_KEY not set")
-
-    llm_client = og.LLM(private_key=private_key)
-
+def _init_og():
+    global OG_OK, llm_client, og, _ready
     try:
-        approval = llm_client.ensure_opg_approval(min_allowance=0.5)
-        print(f"OPG approval: {approval}")
-    except Exception as e:
-        print(f"Approval warning (non-fatal): {e}")
+        import opengradient as _og
+        import ssl, urllib3
+        og = _og
+        ssl._create_default_https_context = ssl._create_unverified_context
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    OG_OK = True
-    print("OG connected")
-except Exception as e:
-    print(f"Demo mode: {e}")
+        private_key = os.environ.get("OG_PRIVATE_KEY", "")
+        if not private_key:
+            raise ValueError("OG_PRIVATE_KEY not set")
 
+        llm_client = og.LLM(private_key=private_key)
 
-def self_ping():
-    import urllib.request
-    time.sleep(60)
-    while True:
-        time.sleep(240)
+        # This can take a few seconds — fine in background
         try:
-            url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
-            urllib.request.urlopen(f"{url}/health", timeout=10)
-            print("Self-ping OK")
+            approval = llm_client.ensure_opg_approval(min_allowance=0.5)
+            print(f"OPG approval: {approval}")
         except Exception as e:
-            print(f"Self-ping failed: {e}")
+            print(f"Approval warning (non-fatal): {e}")
 
+        OG_OK = True
+        print("OG connected")
+    except Exception as e:
+        print(f"OG init failed: {e}")
+    finally:
+        _ready = True
+        # Probe models right after init
+        if OG_OK:
+            probe_models()
+
+# ── Model probing ─────────────────────────────────────────────────────────────
 
 def extract_raw(result):
-    """Extract text from OG result. Per docs: result.chat_output['content']"""
     if not result:
         return ""
-    # Primary path per OG docs
     co = getattr(result, 'chat_output', None)
     if co:
         if isinstance(co, dict) and co.get('content'):
             return str(co['content'])
         if isinstance(co, str) and co.strip():
             return co
-    # Fallback: completion_output
     comp = getattr(result, 'completion_output', None)
     if comp and str(comp).strip():
         return str(comp)
-    # Last resort: scan all string attrs
     for attr in dir(result):
         if attr.startswith('_'):
             continue
@@ -108,14 +100,13 @@ def extract_raw(result):
 
 
 def probe_models():
-    """Find a working model. Runs in background — never blocks gunicorn."""
     global WORKING_MODEL
     if not OG_OK or llm_client is None:
         return
     print("Probing models...")
     for name in MODEL_PRIORITY:
         if not hasattr(og.TEE_LLM, name):
-            print(f"  SKIP {name} — not in SDK")
+            print(f"  SKIP {name}")
             continue
         model = getattr(og.TEE_LLM, name)
         try:
@@ -127,7 +118,7 @@ def probe_models():
                 temperature=0.0,
             ), timeout=30)
             raw = extract_raw(result)
-            print(f"  {name} raw: {repr(raw[:80])}")
+            print(f"  {name} -> {repr(raw[:60])}")
             if raw and raw.strip():
                 WORKING_MODEL = model
                 print(f"✓ Using model: {name}")
@@ -145,7 +136,7 @@ def parse_json(raw):
         try:
             return json.loads(m.group(1).strip())
         except Exception as e:
-            print(f"JSON parse error inside <JSON> tags: {e}")
+            print(f"JSON parse error: {e}")
     m = re.search(r'\{[\s\S]*?"risk_score"[\s\S]*\}', raw)
     if m:
         try:
@@ -159,11 +150,10 @@ def call_llm(messages, retries=3):
     global WORKING_MODEL
     if not OG_OK or llm_client is None:
         return {"error": "OpenGradient not available"}
-
     if WORKING_MODEL is None:
         probe_models()
     if WORKING_MODEL is None:
-        return {"error": "No working LLM model found — check OG testnet status"}
+        return {"error": "No working LLM model found"}
 
     last_error = ""
     for attempt in range(retries):
@@ -176,9 +166,9 @@ def call_llm(messages, retries=3):
                 temperature=0.3,
             ), timeout=110)
             raw = extract_raw(result)
-            print(f"Raw response (first 200): {repr(raw[:200])}")
+            print(f"Raw (200): {repr(raw[:200])}")
             if not raw.strip():
-                last_error = "Empty response from model"
+                last_error = "Empty response"
                 time.sleep(2)
                 continue
             parsed = parse_json(raw)
@@ -203,7 +193,6 @@ def call_llm(messages, retries=3):
                     break
             else:
                 time.sleep(3)
-
     return {"error": f"All attempts failed: {last_error}"}
 
 
@@ -234,12 +223,13 @@ Return this exact structure:
 </JSON>
 
 Rules:
-- risk_score: 0-100 (higher = more risky for the signing party)
-- risks: 3-8 issues ordered high to medium to low
-- level: must be exactly "high", "medium", or "low"
+- risk_score: 0-100 (higher = more risky)
+- risks: 3-8 issues, ordered high to medium to low
+- level: exactly "high", "medium", or "low"
 - Be specific, not generic
 """
 
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -251,6 +241,7 @@ def health():
     return jsonify({
         "status": "ok",
         "og": OG_OK,
+        "ready": _ready,
         "model": str(WORKING_MODEL) if WORKING_MODEL else None,
     })
 
@@ -268,16 +259,13 @@ def analyze():
     print(f"\nAnalyzing | type: '{doc_type}' | chars: {len(doc_text)}")
 
     user_content = []
-
     if pdf_base64:
         user_content.append({
             "type": "document",
             "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_base64}
         })
-
     if doc_text:
         user_content.append({"type": "text", "text": f"LEGAL DOCUMENT:\n\n{doc_text}"})
-
     user_content.append({"type": "text", "text": f"Document type: {doc_type}\n\nAnalyze and return the JSON."})
 
     messages = [
@@ -285,24 +273,36 @@ def analyze():
         {"role": "user", "content": user_content if len(user_content) > 1 else user_content[0]["text"]}
     ]
 
-    result = call_llm(messages)
-    return jsonify(result)
+    return jsonify(call_llm(messages))
 
+
+# ── Startup ───────────────────────────────────────────────────────────────────
 
 def _startup():
-    threading.Thread(target=self_ping, daemon=True).start()
-    def _delayed_probe():
-        time.sleep(8)
-        probe_models()
-    threading.Thread(target=_delayed_probe, daemon=True).start()
+    # OG init in background — app responds immediately, init happens async
+    threading.Thread(target=_init_og, daemon=True).start()
+
+    # Self-ping to keep Render free tier alive
+    def _ping():
+        time.sleep(120)
+        import urllib.request
+        while True:
+            time.sleep(240)
+            try:
+                url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
+                urllib.request.urlopen(f"{url}/health", timeout=10)
+                print("Self-ping OK")
+            except Exception as e:
+                print(f"Self-ping failed: {e}")
+    threading.Thread(target=_ping, daemon=True).start()
 
 
+# gunicorn hook — called once per worker after fork
 def post_fork(server, worker):
     _startup()
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    print(f"LexGuard on :{port} | OG: {'live' if OG_OK else 'demo'}")
     _startup()
     app.run(host="0.0.0.0", port=port, debug=False)
