@@ -14,7 +14,6 @@ WORKING_MODEL = None
 _loop = None
 _ready = False
 
-# Cheapest/most available first
 MODEL_PRIORITY = [
     "CLAUDE_HAIKU_4_5",
     "CLAUDE_SONNET_4_5",
@@ -32,14 +31,18 @@ def _start_loop():
 
 threading.Thread(target=_start_loop, daemon=True).start()
 
-def _run(coro, timeout=90):
-    # Wait until loop is ready (max 10s)
+def _run(coro, timeout=60):
     deadline = time.time() + 10
     while _loop is None and time.time() < deadline:
         time.sleep(0.1)
     if _loop is None:
         raise RuntimeError("Event loop not ready")
-    return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=timeout)
+
+    # Wrap coroutine with asyncio timeout inside the loop
+    async def _with_timeout():
+        return await asyncio.wait_for(coro, timeout=timeout)
+
+    return asyncio.run_coroutine_threadsafe(_with_timeout(), _loop).result(timeout=timeout + 5)
 
 # ── OG init ───────────────────────────────────────────────────────────────────
 
@@ -64,18 +67,17 @@ def _init_og():
             print(f"Approval warning: {e}")
 
         OG_OK = True
-        print("OG connected — model will be selected on first request")
+        print("OG connected")
     except Exception as e:
         print(f"OG init failed: {e}")
     finally:
         _ready = True
 
-# ── Model selection (lazy, on first real request) ─────────────────────────────
+# ── Model selection ───────────────────────────────────────────────────────────
 
 def extract_raw(result):
     if not result:
         return ""
-    # Per OG docs: result.chat_output['content']
     co = getattr(result, 'chat_output', None)
     if co:
         if isinstance(co, dict) and co.get('content'):
@@ -85,7 +87,6 @@ def extract_raw(result):
     comp = getattr(result, 'completion_output', None)
     if comp and str(comp).strip():
         return str(comp)
-    # Scan all string attrs
     for attr in dir(result):
         if attr.startswith('_'):
             continue
@@ -101,7 +102,6 @@ def extract_raw(result):
 
 
 def pick_model():
-    """Try each model with a short test. Sets WORKING_MODEL."""
     global WORKING_MODEL
     if not OG_OK or llm_client is None:
         return
@@ -111,21 +111,23 @@ def pick_model():
             continue
         model = getattr(og.TEE_LLM, name)
         try:
-            print(f"  Trying {name}...")
+            print(f"  Trying {name} (timeout=60s)...")
             result = _run(llm_client.chat(
                 model=model,
                 messages=[{"role": "user", "content": "Say: OK"}],
                 max_tokens=5,
                 temperature=0.0,
-            ), timeout=90)
+            ), timeout=60)
             raw = extract_raw(result)
-            print(f"  {name} response: {repr(raw[:80])}")
+            print(f"  {name} -> {repr(raw[:80])}")
             if raw and raw.strip():
                 WORKING_MODEL = model
                 print(f"✓ Model selected: {name}")
                 return
+        except asyncio.TimeoutError:
+            print(f"  {name}: asyncio timeout — trying next")
         except TimeoutError:
-            print(f"  {name}: timeout (90s) — trying next")
+            print(f"  {name}: timeout — trying next")
         except Exception as e:
             import traceback
             print(f"  {name}: {e}\n{traceback.format_exc()}")
@@ -135,7 +137,6 @@ def pick_model():
 _model_lock = threading.Lock()
 
 def ensure_model():
-    """Pick model if not already selected."""
     global WORKING_MODEL
     if WORKING_MODEL is not None:
         return
@@ -162,14 +163,14 @@ def parse_json(raw):
     return {"error": "Parse failed", "raw": raw[:300]}
 
 
-def call_llm(messages, retries=3):
+def call_llm(messages, retries=2):
     global WORKING_MODEL
     if not OG_OK or llm_client is None:
         return {"error": "OpenGradient not available"}
 
     ensure_model()
     if WORKING_MODEL is None:
-        return {"error": "No working LLM model found"}
+        return {"error": "No working LLM model found — OG testnet may be down"}
 
     last_error = ""
     for attempt in range(retries):
@@ -180,7 +181,7 @@ def call_llm(messages, retries=3):
                 messages=messages,
                 max_tokens=3000,
                 temperature=0.3,
-            ), timeout=90)
+            ), timeout=80)
             raw = extract_raw(result)
             print(f"Raw (200): {repr(raw[:200])}")
             if not raw.strip():
@@ -199,16 +200,18 @@ def call_llm(messages, retries=3):
                     "explorer_url": f"https://explorer.opengradient.ai/tx/{tx}",
                 }
             return parsed
+        except (asyncio.TimeoutError, TimeoutError):
+            last_error = "Model timeout"
+            print(f"LLM timeout attempt {attempt+1}")
+            WORKING_MODEL = None
+            ensure_model()
+            if WORKING_MODEL is None:
+                break
         except Exception as e:
             last_error = str(e)
             print(f"LLM error attempt {attempt+1}: {e}")
-            if "402" in str(e):
-                WORKING_MODEL = None
-                ensure_model()
-                if WORKING_MODEL is None:
-                    break
-            else:
-                time.sleep(3)
+            time.sleep(3)
+
     return {"error": f"All attempts failed: {last_error}"}
 
 
@@ -305,7 +308,6 @@ def _ping():
             print(f"Self-ping failed: {e}")
 
 
-# gunicorn hook
 def post_fork(server, worker):
     threading.Thread(target=_init_og, daemon=True).start()
     threading.Thread(target=_ping, daemon=True).start()
