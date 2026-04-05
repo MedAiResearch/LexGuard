@@ -1,5 +1,5 @@
 import os, json, re, time, asyncio, threading
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -242,7 +242,7 @@ Rules:
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "service": "LexGuard"})
+    return send_from_directory('.', 'index.html')
 
 
 @app.route("/health")
