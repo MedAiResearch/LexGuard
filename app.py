@@ -14,13 +14,12 @@ WORKING_MODEL = None
 _loop = None
 _ready = False
 
+# Cheapest/most available first
 MODEL_PRIORITY = [
     "CLAUDE_HAIKU_4_5",
     "CLAUDE_SONNET_4_5",
     "CLAUDE_SONNET_4_6",
     "GPT_5_MINI",
-    "GEMINI_2_5_FLASH_LITE",
-    "GEMINI_2_5_FLASH",
 ]
 
 # ── Event loop ────────────────────────────────────────────────────────────────
@@ -32,12 +31,17 @@ def _start_loop():
     _loop.run_forever()
 
 threading.Thread(target=_start_loop, daemon=True).start()
-time.sleep(0.2)
 
-def _run(coro, timeout=120):
+def _run(coro, timeout=90):
+    # Wait until loop is ready (max 10s)
+    deadline = time.time() + 10
+    while _loop is None and time.time() < deadline:
+        time.sleep(0.1)
+    if _loop is None:
+        raise RuntimeError("Event loop not ready")
     return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=timeout)
 
-# ── OG init (runs in background thread) ──────────────────────────────────────
+# ── OG init ───────────────────────────────────────────────────────────────────
 
 def _init_og():
     global OG_OK, llm_client, og, _ready
@@ -60,18 +64,18 @@ def _init_og():
             print(f"Approval warning: {e}")
 
         OG_OK = True
-        print("OG connected")
-        probe_models()
+        print("OG connected — model will be selected on first request")
     except Exception as e:
         print(f"OG init failed: {e}")
     finally:
         _ready = True
 
-# ── Model probe ───────────────────────────────────────────────────────────────
+# ── Model selection (lazy, on first real request) ─────────────────────────────
 
 def extract_raw(result):
     if not result:
         return ""
+    # Per OG docs: result.chat_output['content']
     co = getattr(result, 'chat_output', None)
     if co:
         if isinstance(co, dict) and co.get('content'):
@@ -81,6 +85,7 @@ def extract_raw(result):
     comp = getattr(result, 'completion_output', None)
     if comp and str(comp).strip():
         return str(comp)
+    # Scan all string attrs
     for attr in dir(result):
         if attr.startswith('_'):
             continue
@@ -88,48 +93,55 @@ def extract_raw(result):
             val = getattr(result, attr)
             if callable(val):
                 continue
-            if isinstance(val, str) and ('"risk_score"' in val or '<JSON>' in val):
+            if isinstance(val, str) and val.strip() and len(val) > 1:
                 return val
         except:
             pass
     return ""
 
 
-def probe_models():
+def pick_model():
+    """Try each model with a short test. Sets WORKING_MODEL."""
     global WORKING_MODEL
     if not OG_OK or llm_client is None:
         return
-    print("Probing models...")
+    print("Selecting model...")
     for name in MODEL_PRIORITY:
         if not hasattr(og.TEE_LLM, name):
-            print(f"  SKIP {name}")
             continue
         model = getattr(og.TEE_LLM, name)
         try:
-            print(f"Testing {name}...")
+            print(f"  Trying {name}...")
             result = _run(llm_client.chat(
                 model=model,
                 messages=[{"role": "user", "content": "Say: OK"}],
-                max_tokens=10,
+                max_tokens=5,
                 temperature=0.0,
-            ), timeout=30)
+            ), timeout=90)
             raw = extract_raw(result)
-            # Full debug dump to find correct attribute
-            print(f"  {name} -> {repr(raw[:60])}")
-            print(f"  result type: {type(result)}")
-            print(f"  result attrs: {[a for a in dir(result) if not a.startswith('_')]}")
-            try:
-                print(f"  chat_output: {repr(getattr(result, 'chat_output', None))}")
-                print(f"  completion_output: {repr(getattr(result, 'completion_output', None))}")
-            except Exception as de:
-                print(f"  dump error: {de}")
+            print(f"  {name} response: {repr(raw[:80])}")
             if raw and raw.strip():
                 WORKING_MODEL = model
-                print(f"✓ Using model: {name}")
+                print(f"✓ Model selected: {name}")
                 return
+        except TimeoutError:
+            print(f"  {name}: timeout (90s) — trying next")
         except Exception as e:
-            import traceback; print(f"  FAIL {name}: {e}\n{traceback.format_exc()}")
-    print("No working model found.")
+            import traceback
+            print(f"  {name}: {e}\n{traceback.format_exc()}")
+    print("WARNING: No working model found")
+
+
+_model_lock = threading.Lock()
+
+def ensure_model():
+    """Pick model if not already selected."""
+    global WORKING_MODEL
+    if WORKING_MODEL is not None:
+        return
+    with _model_lock:
+        if WORKING_MODEL is None:
+            pick_model()
 
 
 def parse_json(raw):
@@ -154,8 +166,8 @@ def call_llm(messages, retries=3):
     global WORKING_MODEL
     if not OG_OK or llm_client is None:
         return {"error": "OpenGradient not available"}
-    if WORKING_MODEL is None:
-        probe_models()
+
+    ensure_model()
     if WORKING_MODEL is None:
         return {"error": "No working LLM model found"}
 
@@ -168,7 +180,7 @@ def call_llm(messages, retries=3):
                 messages=messages,
                 max_tokens=3000,
                 temperature=0.3,
-            ), timeout=110)
+            ), timeout=90)
             raw = extract_raw(result)
             print(f"Raw (200): {repr(raw[:200])}")
             if not raw.strip():
@@ -192,7 +204,7 @@ def call_llm(messages, retries=3):
             print(f"LLM error attempt {attempt+1}: {e}")
             if "402" in str(e):
                 WORKING_MODEL = None
-                probe_models()
+                ensure_model()
                 if WORKING_MODEL is None:
                     break
             else:
@@ -278,8 +290,8 @@ def analyze():
 
     return jsonify(call_llm(messages))
 
+# ── Startup ───────────────────────────────────────────────────────────────────
 
-# Self-ping (called from gunicorn.conf post_fork or __main__)
 def _ping():
     time.sleep(120)
     import urllib.request
@@ -293,8 +305,13 @@ def _ping():
             print(f"Self-ping failed: {e}")
 
 
+# gunicorn hook
+def post_fork(server, worker):
+    threading.Thread(target=_init_og, daemon=True).start()
+    threading.Thread(target=_ping, daemon=True).start()
+
+
 if __name__ == "__main__":
-    # Direct run: start threads here
     threading.Thread(target=_init_og, daemon=True).start()
     threading.Thread(target=_ping, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
