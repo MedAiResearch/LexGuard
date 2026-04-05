@@ -114,13 +114,21 @@ def probe_models():
                 temperature=0.0,
             ), timeout=30)
             raw = extract_raw(result)
+            # Full debug dump to find correct attribute
             print(f"  {name} -> {repr(raw[:60])}")
+            print(f"  result type: {type(result)}")
+            print(f"  result attrs: {[a for a in dir(result) if not a.startswith('_')]}")
+            try:
+                print(f"  chat_output: {repr(getattr(result, 'chat_output', None))}")
+                print(f"  completion_output: {repr(getattr(result, 'completion_output', None))}")
+            except Exception as de:
+                print(f"  dump error: {de}")
             if raw and raw.strip():
                 WORKING_MODEL = model
                 print(f"✓ Using model: {name}")
                 return
         except Exception as e:
-            print(f"  FAIL {name}: {e}")
+            import traceback; print(f"  FAIL {name}: {e}\n{traceback.format_exc()}")
     print("No working model found.")
 
 
