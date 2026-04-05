@@ -12,7 +12,7 @@ llm_client = None
 og = None
 WORKING_MODEL = None
 _loop = None
-_ready = False  # True once background init finishes
+_ready = False
 
 MODEL_PRIORITY = [
     "CLAUDE_HAIKU_4_5",
@@ -23,7 +23,7 @@ MODEL_PRIORITY = [
     "GEMINI_2_5_FLASH",
 ]
 
-# ── Async event loop in its own thread ───────────────────────────────────────
+# ── Event loop ────────────────────────────────────────────────────────────────
 
 def _start_loop():
     global _loop
@@ -37,7 +37,7 @@ time.sleep(0.2)
 def _run(coro, timeout=120):
     return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=timeout)
 
-# ── OG init — runs in background, never blocks gunicorn ──────────────────────
+# ── OG init (runs in background thread) ──────────────────────────────────────
 
 def _init_og():
     global OG_OK, llm_client, og, _ready
@@ -53,25 +53,21 @@ def _init_og():
             raise ValueError("OG_PRIVATE_KEY not set")
 
         llm_client = og.LLM(private_key=private_key)
-
-        # This can take a few seconds — fine in background
         try:
             approval = llm_client.ensure_opg_approval(min_allowance=0.5)
             print(f"OPG approval: {approval}")
         except Exception as e:
-            print(f"Approval warning (non-fatal): {e}")
+            print(f"Approval warning: {e}")
 
         OG_OK = True
         print("OG connected")
+        probe_models()
     except Exception as e:
         print(f"OG init failed: {e}")
     finally:
         _ready = True
-        # Probe models right after init
-        if OG_OK:
-            probe_models()
 
-# ── Model probing ─────────────────────────────────────────────────────────────
+# ── Model probe ───────────────────────────────────────────────────────────────
 
 def extract_raw(result):
     if not result:
@@ -226,7 +222,6 @@ Rules:
 - risk_score: 0-100 (higher = more risky)
 - risks: 3-8 issues, ordered high to medium to low
 - level: exactly "high", "medium", or "low"
-- Be specific, not generic
 """
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -276,33 +271,27 @@ def analyze():
     return jsonify(call_llm(messages))
 
 
-# ── Startup ───────────────────────────────────────────────────────────────────
+# ── Start background init immediately at import time ─────────────────────────
+# Works with both gunicorn (gthread) and direct python run
 
-def _startup():
-    # OG init in background — app responds immediately, init happens async
-    threading.Thread(target=_init_og, daemon=True).start()
+_init_thread = threading.Thread(target=_init_og, daemon=True)
+_init_thread.start()
 
-    # Self-ping to keep Render free tier alive
-    def _ping():
-        time.sleep(120)
-        import urllib.request
-        while True:
-            time.sleep(240)
-            try:
-                url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
-                urllib.request.urlopen(f"{url}/health", timeout=10)
-                print("Self-ping OK")
-            except Exception as e:
-                print(f"Self-ping failed: {e}")
-    threading.Thread(target=_ping, daemon=True).start()
+# Self-ping to keep Render free tier alive
+def _ping():
+    time.sleep(120)
+    import urllib.request
+    while True:
+        time.sleep(240)
+        try:
+            url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
+            urllib.request.urlopen(f"{url}/health", timeout=10)
+            print("Self-ping OK")
+        except Exception as e:
+            print(f"Self-ping failed: {e}")
 
-
-# gunicorn hook — called once per worker after fork
-def post_fork(server, worker):
-    _startup()
-
+threading.Thread(target=_ping, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    _startup()
     app.run(host="0.0.0.0", port=port, debug=False)
