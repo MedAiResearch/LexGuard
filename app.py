@@ -271,13 +271,7 @@ def analyze():
     return jsonify(call_llm(messages))
 
 
-# ── Start background init immediately at import time ─────────────────────────
-# Works with both gunicorn (gthread) and direct python run
-
-_init_thread = threading.Thread(target=_init_og, daemon=True)
-_init_thread.start()
-
-# Self-ping to keep Render free tier alive
+# Self-ping (called from gunicorn.conf post_fork or __main__)
 def _ping():
     time.sleep(120)
     import urllib.request
@@ -290,8 +284,10 @@ def _ping():
         except Exception as e:
             print(f"Self-ping failed: {e}")
 
-threading.Thread(target=_ping, daemon=True).start()
 
 if __name__ == "__main__":
+    # Direct run: start threads here
+    threading.Thread(target=_init_og, daemon=True).start()
+    threading.Thread(target=_ping, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
