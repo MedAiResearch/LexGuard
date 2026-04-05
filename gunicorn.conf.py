@@ -1,3 +1,8 @@
-timeout = 300
+import os
+bind = f"0.0.0.0:{os.environ.get('PORT', '10000')}"
 workers = 1
-bind = "0.0.0.0:5002"
+worker_class = "gevent"
+worker_connections = 10
+timeout = 300
+graceful_timeout = 60
+keepalive = 5
